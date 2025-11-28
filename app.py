@@ -166,15 +166,17 @@ def update_json_from_df(data: Dict[str, Any], df: pd.DataFrame) -> Dict[str, Any
 
 def extract_program_items_from_html(html: str) -> List[str]:
     """
-    研修紹介ページの HTML から「プログラム」セクションの項目名をできるだけそのまま抜き出す。
-    主に <h2>プログラム</h2> の直後の <ul><li> や <table> の行を想定。
+    研修紹介ページの HTML から、
+    「研修で学べる主な項目」が箇条書きや表で列挙されている部分を
+    できるだけそのまま抜き出す。
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # 「プログラム」という見出しを探す
+    # 「プログラム」「カリキュラム」「研修内容」などの見出しを探す
+    keywords = ["プログラム", "カリキュラム", "研修内容", "主な内容", "内容"]
     program_header = soup.find(
         lambda tag: tag.name in ["h1", "h2", "h3", "h4"]
-        and "プログラム" in tag.get_text()
+        and any(kw in tag.get_text() for kw in keywords)
     )
 
     items: List[str] = []
@@ -216,33 +218,36 @@ def extract_program_items_from_html(html: str) -> List[str]:
 
 
 #######################################################################
-# ② HTML が取れなかった場合：ページ全文から LLM で項目抽出（原文優先）
+# ② テキスト全体から LLM で項目抽出（原文優先）
 #######################################################################
 
 def extract_program_items_with_llm(page_text: str) -> List[str]:
     """
-    ページ全体のテキストから LLM を使って「プログラム項目名」だけを抽出。
+    テキスト全体から LLM を使って
+    「研修で学べる主な項目名」だけを抽出。
+    研修テキストや紹介ページ内で箇条書き・目次などとして
+    列挙されている行をそのまま取り出すイメージ。
     """
     prompt = f"""
-あなたは企業研修のプログラム構成を整理する専門アナリストです。
-以下のページテキストから、「研修プログラムの項目名」だけを抽出してください。
+あなたは企業研修の構成を整理する専門アナリストです。
+以下のテキストから、「研修で学べる主な項目・テーマ」が
+箇条書きや目次、セクション見出しとして列挙されている部分だけを抽出してください。
 
-- 各行1項目
-- 時間（例：13:00〜）などは除外
-- 内容タイトル（例：○○の理解・○○の実践 など）を優先
-- 原文表現をできるだけ維持する
-- 7〜9項目程度でまとめる
-- 出力は「項目名のみ」を改行区切りで並べる
+- 研修で学べる内容として列挙されている行のみを対象とする
+- 新しい項目を勝手に作らない
+- 項目の数や順番を変えない
+- 各行1項目として、そのままの順番で出力する
+- この段階では、文字数は長くてよい（後で短くする）
 
 ---
-ページ全文:
+テキスト全文:
 \"\"\"{page_text}\"\"\"
 """
 
     resp = client.chat.completions.create(
         model="gpt-4.1",
         messages=[
-            {"role": "system", "content": "あなたは研修プログラム構造の抽出に特化したアナリストです。"},
+            {"role": "system", "content": "あなたは研修構成の抽出に特化したアナリストです。"},
             {"role": "user", "content": prompt},
         ],
         temperature=0.0,
@@ -255,23 +260,25 @@ def extract_program_items_with_llm(page_text: str) -> List[str]:
 
 
 #######################################################################
-# ③ 最終整理：7項目（6〜8項目許容）MECE化、原文優先
+# ③ 最終整理：元の順番のまま15文字以内に短縮
 #######################################################################
 
 def normalize_program_items_with_llm(raw_items: List[str]) -> List[str]:
     """
     原文項目 raw_items をベースに、
-    ・基本 8 項目（7〜9 も許容）
-    ・原文の言葉をできるだけ優先
-    ・もれなくダブりなく（MECE）
-    ・各行1項目で7行に整形
+    ・項目数は増減せず
+    ・順番もそのまま
+    ・各項目を 15 文字以内のラベルに短縮
     という要件で再編成する。
     """
 
-    prompt = f"""
-あなたは企業研修プログラムの構造化専門アナリストです。
+    if not raw_items:
+        return []
 
-以下は研修ページから抽出した「プログラム項目の原文リスト」です。
+    prompt = f"""
+あなたは企業研修の内容整理に精通した専門アナリストです。
+
+以下は研修で学べる項目の原文リストです。各行が1項目です。
 
 【原文リスト】
 {chr(10).join("- " + item for item in raw_items)}
@@ -279,24 +286,17 @@ def normalize_program_items_with_llm(raw_items: List[str]) -> List[str]:
 ---
 
 # 指示
-1. 原文の表現をできるだけ維持しつつ、意味が重複する項目は統合する。なるべくそのままで良い。
-2. 細かすぎる項目は「意味の塊」にまとめてよい。
-3. 基本的に **8項目** にまとめる（どうしても無理なら **7〜9項目** でも可だが基本8項目にしてほしい）。
-4. もれなく・ダブりなく（MECE）に再編成すること。
-5. 出力は「各行1項目」、先頭に「・」を付けて縦に並べること。
-6. できるだけ端的な言葉で短くまとめること。（15文字以内）
-7. 原文リストの上から順の流れをできるだけ維持すること（順番を大きく入れ替えない）。
+1. 各項目について、意味を変えずに15文字以内の短い見出しに言い換えてください。
+2. 項目の数を増減してはいけません。
+3. 行の順番も絶対に変えないでください。
+4. 出力は、原文リストと同じ行数で「各行1項目」のみを縦に並べてください。
+5. 番号や「・」は付けず、項目名だけを書いてください。
 ---
 
 # 出力形式（厳守）
-・項目1
-・項目2
-・項目3
-・項目4
-・項目5
-・項目6
-・項目7
-・項目8
+項目1の短い名前
+項目2の短い名前
+...
 """
 
     resp = client.chat.completions.create(
@@ -309,17 +309,16 @@ def normalize_program_items_with_llm(raw_items: List[str]) -> List[str]:
         max_tokens=600,
     )
 
-    lines = resp.choices[0].message.content.splitlines()
-    results = [
-        line.replace("・", "").strip(" -　")
-        for line in lines
-        if line.strip()
-    ]
-    return results
+    lines = [line.strip() for line in resp.choices[0].message.content.splitlines() if line.strip()]
+    # 念のため、行数が変わっていたら元の文字列を15文字でカットして使う
+    if len(lines) != len(raw_items):
+        return [item[:15] for item in raw_items]
+
+    return lines
 
 
 #######################################################################
-# ④ URL 全体処理：HTML → 原文抽出 → LLM で 7 項目に MECE 化
+# ④ URL 全体処理：HTML → 原文抽出 → LLM で 15文字以内に短縮
 #######################################################################
 
 def get_program_items_from_url(url: str) -> List[str]:
@@ -327,7 +326,7 @@ def get_program_items_from_url(url: str) -> List[str]:
     URL からページを取得し、
     1. HTML構造から原文項目を抽出
     2. LLMが補完（fallback）
-    3. 最後に 7 項目（6〜8可）MECE に統合
+    3. 15文字以内のラベルに短縮（順番・件数は維持）
     の 3 段階で項目リストを返す。
     """
 
@@ -344,9 +343,23 @@ def get_program_items_from_url(url: str) -> List[str]:
         text = soup.get_text(separator="\n", strip=True)
         raw_items = extract_program_items_with_llm(text)
 
-    # ③ 最終：7 項目（MECE）に正規化
+    # ③ 15 文字以内に正規化（順番・件数は維持）
     normalized_items = normalize_program_items_with_llm(raw_items)
 
+    return normalized_items
+
+
+#######################################################################
+# ⑤ テキスト（研修テキスト等）からの項目抽出
+#######################################################################
+
+def get_program_items_from_text(text: str) -> List[str]:
+    """
+    研修テキストなどのプレーンテキストから
+    研修で学べる項目を抽出し、15文字以内のラベルに整形する。
+    """
+    raw_items = extract_program_items_with_llm(text)
+    normalized_items = normalize_program_items_with_llm(raw_items)
     return normalized_items
 
 
@@ -369,8 +382,8 @@ def generate_evaluation_excel(data: Dict[str, Any]) -> bytes:
 def generate_summary_sheet_excel(data: Dict[str, Any]) -> bytes:
     """
     受講者向けまとめシートの Excel を生成。
-    添付画像のように、上部に期待欄＋
-    各項目ごとに大きな記入欄を持つレイアウトにする。
+    各採点項目ごとの解答欄と、
+    最後に「今後社内で実践していきたい事柄」の解答欄を配置する。
     """
     output = io.BytesIO()
 
@@ -382,8 +395,13 @@ def generate_summary_sheet_excel(data: Dict[str, Any]) -> bytes:
 
         # 書式定義
         border = {"border": 1}
-        bold = workbook.add_format({**border, "bold": True, "valign": "top"})
+        bold_large = workbook.add_format(
+            {**border, "bold": True, "valign": "top", "font_size": 14}
+        )
         normal = workbook.add_format({**border, "valign": "top", "text_wrap": True})
+        explain_fmt = workbook.add_format(
+            {**border, "valign": "top", "text_wrap": True, "font_size": 10}
+        )
 
         # 列幅調整（お好みで調整してください）
         worksheet.set_column("A:A", 5)   # 番号など
@@ -392,47 +410,33 @@ def generate_summary_sheet_excel(data: Dict[str, Any]) -> bytes:
 
         row = 0  # 0-index
 
-        # ===== 上部の共通欄（例：会社・上司からの期待など） =====
-        # 1. 会社／上司からの期待
-        worksheet.merge_range(row, 0, row, 2, "【会社または上司からの受講者への期待】", bold)
-        row += 1
-        worksheet.merge_range(row, 0, row, 2, "", normal)
-        worksheet.set_row(row, 80)  # 記入しやすいように高さを確保
-        row += 2  # 1 行空けたいなら +2 にする
-
-        # 2. 受講に対する事前期待
-        worksheet.merge_range(row, 0, row, 2, "【受講に対する事前期待（受講者による記入）】", bold)
-        row += 1
-        worksheet.merge_range(row, 0, row, 2, "", normal)
-        worksheet.set_row(row, 80)
-        row += 2
-
-        # 3. 研修当日の振り返り欄（必要に応じて文言調整）
-        worksheet.merge_range(row, 0, row, 2, "【研修当日に記入】", bold)
-        row += 1
-        worksheet.merge_range(row, 0, row, 2, "", normal)
-        worksheet.set_row(row, 80)
-        row += 2
-
         # ===== 各採点項目ごとの記入欄 =====
         items = data.get("items", [])
 
         for idx, item in enumerate(items, start=1):
             item_name = item.get("name", "")
 
-            # summary_questions をヒントとしてセル内に表示したければここで結合
+            # summary_questions を説明文として表示
             questions = item.get("summary_questions", [])
-            hint_text = "\n".join(f"・{q}" for q in questions) if questions else ""
+            if questions:
+                hint_text = "\n".join(f"・{q}" for q in questions)
+            else:
+                hint_text = "この項目について、研修での学びや今後活かしたい点を具体的に記入してください。"
 
-            # 項目タイトル行：A〜C を結合
-            worksheet.merge_range(row, 0, row, 2, f"{idx}. {item_name}", bold)
+            # 項目タイトル行：A〜C を結合（太字・やや大きめ）
+            worksheet.merge_range(row, 0, row, 2, f"{idx}. {item_name}", bold_large)
             row += 1
 
-            # 記入欄（複数行分まとめて結合）
+            # 説明文行：A〜C を結合（テキストのみ）
+            worksheet.merge_range(row, 0, row, 2, hint_text, explain_fmt)
+            worksheet.set_row(row, 40)
+            row += 1
+
+            # 解答欄（複数行分まとめて結合）
             # ここでは 4 行分(A〜C)を結合して大きな入力欄を作る
             start_row = row
             end_row = row + 3  # 行数はお好みで
-            worksheet.merge_range(start_row, 0, end_row, 2, hint_text, normal)
+            worksheet.merge_range(start_row, 0, end_row, 2, "", normal)
 
             # 高さを少し大きめに
             for r in range(start_row, end_row + 1):
@@ -440,13 +444,30 @@ def generate_summary_sheet_excel(data: Dict[str, Any]) -> bytes:
 
             row = end_row + 2  # 少し間隔を空ける
 
+        # ===== 今後社内で実践していきたい事柄 =====
+        worksheet.merge_range(row, 0, row, 2, "【今後社内で実践していきたい事柄】", bold_large)
+        row += 1
+
+        final_explain = (
+            "研修で得た学びを、今後どのように職場やチームで実践していきたいかを具体的に記入してください。"
+        )
+        worksheet.merge_range(row, 0, row, 2, final_explain, explain_fmt)
+        worksheet.set_row(row, 40)
+        row += 1
+
+        start_row = row
+        end_row = row + 5  # 少し大きめの記入欄
+        worksheet.merge_range(start_row, 0, end_row, 2, "", normal)
+        for r in range(start_row, end_row + 1):
+            worksheet.set_row(r, 50)
+
     return output.getvalue()
 
 
 
 # =========================
-#  デフォルトプロンプト（内容はそのまま）
-#  ※ 研修名・項目・PDFテキストは {training_name} などで差し込み
+#  デフォルトプロンプト（内容はほぼそのまま）
+#  ※ 研修名・項目・研修テキストは {training_name} などで差し込み
 # =========================
 
 DEFAULT_PROMPT_TEMPLATE = """
@@ -457,8 +478,8 @@ DEFAULT_PROMPT_TEMPLATE = """
 あなたは研修システムの採点基準を設計する専門アナリストです。以下の採点項目ごとに評価基準を作成してください:
 {item_list_text}
 
-## PDFテキスト（抽出要点）
-以下は PDF から抽出したテキストです。基準作成の根拠として積極的に活用してください。
+## 研修テキスト（抽出要点）
+以下は研修テキストから抽出した内容です。基準作成の根拠として積極的に活用してください。
 {pdf_text_chunk}
 
 
@@ -480,7 +501,7 @@ DEFAULT_PROMPT_TEMPLATE = """
 1. **Yes/No で判定できる具体条件**
 2. **受講者の記述に表れる行動・思考の例（良い例）を 2 個以上**
 3. **不十分な記述（悪い例）の具体例を 1 個以上**
-4. **可能であれば PDF 内表現の引用を含める**
+4. **可能であれば研修テキスト内の表現の引用を含める**
 5. **抽象語（主体性・協働性など）を避け、観察可能な行動で記述する**
 
 例：
@@ -544,8 +565,8 @@ JSON 以外のテキストは出力しない。
 # =========================
 
 def main():
-    st.set_page_config(page_title="採点基準作成システム β", layout="wide")
-    st.title("採点基準作成システム β版")
+    st.set_page_config(page_title="採点基準作成システム ", layout="wide")
+    st.title("採点基準作成システム ")
 
     # セッション状態初期化
     if "criteria_json" not in st.session_state:
@@ -571,6 +592,13 @@ def main():
             placeholder="例：https://school.jma.or.jp/products/detail.php?product_id=100157",
         )
 
+        # 採点項目抽出用 研修テキスト PDF
+        item_pdf = st.file_uploader(
+            "採点項目抽出用の研修テキスト PDF（URLを使わない場合に利用）",
+            type=["pdf"],
+            key="item_pdf_uploader",
+        )
+
         # session_state に採点項目リストを保持
         if "item_list_text" not in st.session_state:
             st.session_state["item_list_text"] = ""
@@ -581,10 +609,27 @@ def main():
                 st.error("まず研修プログラムのURLを入力してください。")
             else:
                 try:
-                    with st.spinner("Webページからプログラム項目を抽出しています..."):
+                    with st.spinner("Webページから研修項目を抽出しています..."):
                         items = get_program_items_from_url(program_url.strip())
                     if not items:
-                        st.warning("プログラム項目を抽出できませんでした。手動で入力してください。")
+                        st.warning("研修項目を抽出できませんでした。手動で入力してください。")
+                    else:
+                        st.session_state["item_list_text"] = "\n".join(items)
+                        st.success(f"{len(items)}件の項目を抽出しました。下の採点項目リストに反映しています。")
+                except Exception as e:
+                    st.error(f"項目抽出でエラーが発生しました: {e}")
+
+        # PDF から採点項目抽出ボタン
+        if st.button("研修テキストから採点項目を自動抽出"):
+            if item_pdf is None:
+                st.error("まず採点項目抽出用の研修テキスト PDF をアップロードしてください。")
+            else:
+                try:
+                    with st.spinner("研修テキストから研修項目を抽出しています..."):
+                        text = extract_text_from_pdf(item_pdf)
+                        items = get_program_items_from_text(text)
+                    if not items:
+                        st.warning("研修項目を抽出できませんでした。手動で入力してください。")
                     else:
                         st.session_state["item_list_text"] = "\n".join(items)
                         st.success(f"{len(items)}件の項目を抽出しました。下の採点項目リストに反映しています。")
@@ -596,13 +641,14 @@ def main():
             "採点項目リスト（1行1項目）",
             height=200,
             key="item_list_text",
-            help="URLから自動抽出した項目をベースに、ここで手動で修正・追記できます。",
+            help="自動抽出した項目をベースに、ここで手動で修正・追記できます。",
         )
 
-        # ④ 研修テキスト PDF
+        # ④ 研修テキスト PDF（基準生成用）
         uploaded_pdf = st.file_uploader(
             "研修テキスト PDF をアップロード（どの研修でも可）",
             type=["pdf"],
+            key="criteria_pdf_uploader",
         )
 
         # ⑤ 任意の講師フィードバック
@@ -629,11 +675,11 @@ def main():
         # ⑧ 基準案生成ボタン
         if st.button("基準案を生成", type="primary"):
             if uploaded_pdf is None:
-                st.error("PDF をアップロードしてください。")
+                st.error("研修テキスト PDF をアップロードしてください。")
             elif not training_name.strip():
                 st.error("研修名を入力してください。")
             else:
-                with st.spinner("PDF を解析して基準案を生成しています..."):
+                with st.spinner("研修テキストを解析して基準案を生成しています..."):
                     pdf_text = extract_text_from_pdf(uploaded_pdf)
                     items = [
                         line.strip()
